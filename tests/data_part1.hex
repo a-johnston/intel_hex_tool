@@ -1,0 +1,3 @@
+characters prior to the start code should be ignored :020000040801F1
+:045E7D00DEADBEEFE9 // comments should also be ignored. neither should include
+:00000001FF         // records are on their own line anyways

@@ -1,0 +1,54 @@
+[project]
+name = "intel-hex-tool"
+version = "0.0.1"
+description = "Simple CLI tool for working with binary and intel hex files"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+
+authors = [
+  { name="Adam Johnston", email="adam.johnston00@gmail.com" },
+]
+
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+
+    "Development Status :: 3 - Alpha",
+
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+iht = "intel_hex_tool:main"
+
+[dependency-groups]
+dev = [
+  "IPython",
+  "pre-commit",
+  "ruff",
+  "ty ; python_version >= '3.8'",
+  "vermin",
+  "vermin >= 1.7.0; python_version >= '3.8'",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "single"

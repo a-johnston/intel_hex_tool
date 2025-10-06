@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+import os
+import sys
+from argparse import ArgumentParser
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Dict, Iterable, List, NamedTuple, Tuple
+
+DATA_RECORD = 0
+EOF_RECORD = 1
+EXTENDED_LINEAR_ADDRESS_RECORD = 4
+START_ADDRESS_RECORD = 5
+
+_newlines = {'unix': '\n', 'dos': '\r\n'}
+_newline_name = {v: k for k, v in _newlines.items()}
+
+
+def warning(text: str) -> str:
+    return f'\033[93m{text}\033[0m'
+
+
+def get_address_high_low(address: int) -> Tuple[int, int]:
+    """Returns a 2-tuple of the upper and lower 16 bits of a 32 bit value."""
+    return (address >> 16) & 0xFFFF, address & 0xFFFF
+
+
+class IntelHexRow(NamedTuple):
+    address: int
+    record_type: int
+    data: bytes
+    warnings: List[str]
+
+    def _get_non_checksum_bytes(self) -> bytes:
+        parts = (
+            len(self.data).to_bytes(1, 'big'),
+            get_address_high_low(self.address)[1].to_bytes(2, 'big'),
+            self.record_type.to_bytes(1, 'big'),
+            self.data,
+        )
+        return b''.join(parts)
+
+    @property
+    def checksum(self) -> int:
+        """Sums the byte values and returns the two's complement of the least significant byte."""
+        return (~sum(self._get_non_checksum_bytes()) + 1) % 256
+
+    @classmethod
+    def loads(cls, line: str, extended_address: int = 0, start_code: str = ':') -> 'IntelHexRow':
+        """Reads a string containing an intel hex record into this named tuple. The string should be exactly
+        the intel hex row and should not contain comments or multiple start codes."""
+        # Uses https://en.wikipedia.org/wiki/Intel_HEX as a reference
+        _, line = map(str.strip, line.split(start_code))  # Raises if there isn't exactly one start_code
+        data = bytes.fromhex(line)
+        row = cls(
+            address=extended_address + int.from_bytes(data[1:3], 'big'),
+            record_type=data[3],
+            data=data[4:-1],
+            warnings=[],
+        )
+        # Checksum is defined such that the least significant byte of the sum should be zero
+        if sum(data) & 0xFF != 0:
+            row.warnings.append(f'Bad checksum for: {line} ({row.checksum:02X} != {data[-1]:02X})')
+        if len(row.data) != data[0]:
+            row.warnings.append(f'Bad byte count for: {line} ({len(row.data)} != {data[0]})')
+        if row.record_type == EXTENDED_LINEAR_ADDRESS_RECORD and len(row.data) != 2:
+            row.warnings.append(f'Bad extended address record: {line}')
+        if row.record_type == START_ADDRESS_RECORD and len(row.data) != 4:
+            row.warnings.append(f'Bad start address record: {line}')
+        return row
+
+    def dumps(self, start_code: str = ':') -> str:
+        return start_code + (self._get_non_checksum_bytes() + self.checksum.to_bytes(1, 'big')).hex().upper()
+
+
+class HexData(NamedTuple):
+    chunks: Dict[int, bytes]
+    start: int
+    type: str
+    newline: str
+
+    def get_full_bytes(self) -> bytes:
+        last = -1
+        content = b''
+        for offset, data in self.chunks.items():
+            if last != -1:
+                content += bytes(offset - last)
+            content += data
+            last = offset + len(data)
+        return content
+
+    def get_full_hex(self) -> str:
+        return self.get_full_bytes().hex().upper()
+
+    def to_intel_rows(
+        self, custom_offset: int = 0, custom_start: int = -1, max_data_bytes: int = 16
+    ) -> Iterable[IntelHexRow]:
+        last_hi = 0
+        for offset, data in sorted(self.chunks.items()):
+            offset += custom_offset
+            extended_address, address = get_address_high_low(offset)
+            if last_hi != extended_address:
+                yield IntelHexRow(0, EXTENDED_LINEAR_ADDRESS_RECORD, extended_address.to_bytes(2, 'big'), [])
+                last_hi = extended_address
+            for i in range(0, len(data), max_data_bytes):
+                row_data = data[i : i + max_data_bytes]
+                row = IntelHexRow(address, DATA_RECORD, row_data, [])
+                address += len(row_data)
+                yield row
+        start = self.start if custom_start < 0 else custom_start
+        if start > 0:
+            yield IntelHexRow(0, START_ADDRESS_RECORD, start.to_bytes(4, 'big'), [])
+        yield IntelHexRow(0, EOF_RECORD, b'', [])
+
+
+def read_hex(file: str) -> HexData:
+    """Reads a hexfile, first attempting to treat it as an intel hex file but otherwise
+    loads the file's literal bytes with and offset and start value of zero.
+    """
+    try:
+        return read_intel_hex(file)
+    except Exception:
+        pass
+    return read_bin_hex(file)
+
+
+def read_bin_hex(file: str) -> HexData:
+    files = list(Path('.').glob(file))
+    if len(files) != 1:
+        raise ValueError(f'Need exactly one file matching {file} to read binary')
+    # TODO: Find zero blocks and break into chunks
+    return HexData({0: files[0].read_bytes()}, 0, 'bin', '')
+
+
+def _get_record_chunks(records: List[IntelHexRow], max_byte_fill: int = 4) -> Dict[int, bytes]:
+    """Puts records in order and assembles them into contiguous chunks. Gaps greater
+    than max_byte_fill cause multiple chunks to be generated. Other gaps are zero-filled.
+    """
+    chunks = {}
+    records.sort(key=lambda row: row.address)
+    chunk_start = records[0].address
+    chunk = b''
+    for i in range(len(records)):
+        record = records[i]
+        if chunk_start != -1:
+            gap = record.address - chunk_start - len(chunk)
+            if gap < 0:
+                raise Exception(f'Overlapping records detected at address {record.address:08X}')
+            if 0 < gap <= max_byte_fill:
+                chunk += bytes(gap)
+            else:
+                chunks[chunk_start] = chunk
+                chunk = b''
+                chunk_start = record.address
+        chunk += record.data
+    if chunk:
+        chunks[chunk_start] = chunk
+    return chunks
+
+
+def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> HexData:
+    # Uses https://en.wikipedia.org/wiki/Intel_HEX as a reference. Does not implement all record types.
+    records = []
+    extended_address = 0
+    start = -1
+    linesep = ''
+    for path in Path('.').glob(file):
+        with path.open('r', newline='') as fp:
+            for line in fp.readlines():
+                if not linesep:
+                    linesep = line[len(line.rstrip()) :]
+                # Remove comments and skip non-record lines
+                line = line.split(comment, 1)[0].strip()
+                if start_code not in line:
+                    continue
+                row = IntelHexRow.loads(line, extended_address=extended_address, start_code=start_code)
+                if row.warnings:
+                    print(warning('\n'.join(row.warnings)))
+                if row.record_type == EXTENDED_LINEAR_ADDRESS_RECORD:
+                    extended_address = int.from_bytes(row.data, 'big') << 16
+                elif row.record_type == DATA_RECORD:
+                    records.append(row)
+                elif row.record_type == START_ADDRESS_RECORD:
+                    if start != -1:
+                        print(warning('Multiple start address records'))
+                    start = int.from_bytes(row.data, 'big')
+                elif row.record_type == EOF_RECORD:
+                    break
+                else:
+                    print(warning(f'Ignoring record with type {row.record_type.to_bytes(1, "big")}'))
+    return HexData(_get_record_chunks(records), start, 'intel hex', linesep)
+
+
+def _hex_int(data: str) -> int:
+    return int(data, 0x10 if data.startswith('0x') else 10)
+
+
+def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str) -> None:
+    data = read_hex(file)
+    out = sys.stdout
+    if output != '-':
+        out = open(output, 'wb' if binary == 'binary' else 'w')
+    if binary:
+        pass
+    else:
+        rows = data.to_intel_rows(custom_offset=offset, custom_start=start)
+        newline = (data.newline or os.linesep) if newline == 'auto' else _newlines[newline]
+        if newline == 'auto' and data.newline:
+            newline = data.newline
+        else:
+            newline = _newlines.get(newline, os.linesep)
+        out.write(newline.join(map(IntelHexRow.dumps, rows)) + newline)
+    if output != '-':
+        out.close()
+
+
+def _info(files: List[str]) -> None:
+    for file in files:
+        data = read_hex(file)
+        print(f'Info for {file}')
+        print(f'  Type:\t\t{data.type}')
+        print(f'  Start:\t0x{data.start:08X}')
+        if data.newline:
+            newline_name = _newline_name.get(data.newline, 'unknown')
+            print(f'  Line endings:\t{data.newline!r} ({newline_name})')
+        print('  Chunks:')
+        last = -1
+        for offset, chunk in data.chunks.items():
+            if last != -1:
+                gap = offset - last
+                if gap > 0:
+                    print(f'    (0x00 x {gap})')
+            print(f'    Offset = 0x{offset:08X} Length = {(len(chunk))} bytes')
+            last = offset + len(chunk)
+
+
+def _diff(a: str, b: str, exact: bool) -> None:
+    data = read_hex(a)
+    other = read_hex(b)
+    if data.start != other.start:
+        print(f'Start: 0x{data.start:08X} != 0x{other.start:08X}')
+    data_offset = min(data.chunks)
+    other_offset = min(other.chunks)
+    if data_offset != other_offset:
+        print(f'Offset: 0x{data_offset:08X} != 0x{other_offset:08X}')
+
+    a_bytes = data.get_full_bytes()
+    b_bytes = other.get_full_bytes()
+    for tag, i1, i2, j1, j2 in SequenceMatcher(a=a_bytes, b=b_bytes, autojunk=not exact).get_opcodes():
+        if tag == 'equal':
+            continue
+        lines = [f'0x{i1:08X}']
+        if tag in {'delete', 'replace'}:
+            lines[0] += f' -{i2 - i1}'
+            lines.append(f'-- {a_bytes[i1:i2].hex().upper()}')
+        if tag in {'insert', 'replace'}:
+            lines[0] += f' +{j2 - j1}'
+            lines.append(f'++ {b_bytes[j1:j2].hex().upper()}')
+        print('\n' + '\n'.join(lines), flush=True)
+
+
+def main():
+    parser = ArgumentParser(description='Hex file conversion and comparison utilities.')
+    sub = parser.add_subparsers(title='commands')
+
+    help = 'Read and write out a hex file in either intel or binary format.'
+    write = sub.add_parser('write', help=help, description=help)
+    write.add_argument('file', help='Input file')
+    write.add_argument('output', default='-', nargs='?')
+    write.add_argument('-b', '--binary', action='store_true', help='Output a binary file; strips start and offset')
+    write.add_argument('-s', '--start', type=_hex_int, default=-1, help='Optional custom start address')
+    write.add_argument('-o', '--offset', type=_hex_int, default=0, help='Optional address offset')
+    write.add_argument('-n', '--newline', choices=['auto', 'system', *_newlines], default='auto')
+    write.set_defaults(func=_write)
+
+    help = 'Print info for one or more hex files.'
+    info = sub.add_parser('info', help=help, description=help)
+    info.add_argument('files', nargs='+', help='Files to show information for')
+    info.set_defaults(func=_info)
+
+    help = 'Print differences between two hex files.'
+    diff = sub.add_parser('diff', help=help, description=help)
+    diff.add_argument('a')
+    diff.add_argument('b')
+    diff.add_argument('--exact', action='store_true', help='Perform a slower diff that may output a smaller change')
+    diff.set_defaults(func=_diff)
+
+    args = parser.parse_args()
+    args.__dict__.pop('func')(**args.__dict__)
+
+
+if __name__ == '__main__':
+    main()
