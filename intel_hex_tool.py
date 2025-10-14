@@ -78,6 +78,12 @@ class IntelHexRow(NamedTuple):
         return start_code + (self._get_non_checksum_bytes() + self.checksum.to_bytes(1, 'big')).hex().upper()
 
 
+class HexDelta(NamedTuple):
+    address: int
+    removed: bytes
+    added: bytes
+
+
 class HexData(NamedTuple):
     chunks: Dict[int, bytes]
     start: int
@@ -116,6 +122,19 @@ class HexData(NamedTuple):
         if start > 0:
             yield IntelHexRow(0, START_ADDRESS_RECORD, start.to_bytes(4, 'big'), [])
         yield IntelHexRow(0, EOF_RECORD, b'', [])
+
+    def get_deltas(self, other: 'HexData', exact: bool = False, word_aligned: bool = False) -> Iterable[HexDelta]:
+        a = self.get_full_bytes()
+        b = other.get_full_bytes()
+        for tag, i1, i2, j1, j2 in SequenceMatcher(a=a, b=b, autojunk=not exact).get_opcodes():
+            if tag != 'equal':
+                if word_aligned:
+                    i1, i2 = _align(i1, i2)
+                    j1, j2 = _align(j1, j2)
+                yield HexDelta(min(self.chunks) + i1, a[i1:i2], b[j1:j2])
+
+    def apply_delta(self, delta: HexDelta) -> None:
+        pass
 
 
 def read_hex(file: str) -> HexData:
@@ -249,24 +268,14 @@ def _diff(a: str, b: str, exact: bool, disasm: bool, word_aligned: bool) -> None
     if data_offset != other_offset:
         print(f'Offset: 0x{data_offset:08X} != 0x{other_offset:08X}')
 
-    a_bytes = data.get_full_bytes()
-    b_bytes = other.get_full_bytes()
-    for tag, i1, i2, j1, j2 in SequenceMatcher(a=a_bytes, b=b_bytes, autojunk=not exact).get_opcodes():
-        if word_aligned:
-            i1, i2 = _align(i1, i2)
-            j1, j2 = _align(j1, j2)
-        if tag == 'equal':
-            continue
-        lines = [f'0x{i1:08X}']
-        if tag in {'delete', 'replace'}:
-            lines[0] += f' -{i2 - i1}'
-            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(a_bytes[i1:i2]))) if disasm else ''
-            lines.append(f'-- {a_bytes[i1:i2].hex().upper()}{asm}')
-        if tag in {'insert', 'replace'}:
-            lines[0] += f' +{j2 - j1}'
-            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(b_bytes[j1:j2]))) if disasm else ''
-            lines.append(f'++ {b_bytes[j1:j2].hex().upper()}{asm}')
-        print('\n' + '\n'.join(lines), flush=True)
+    for delta in data.get_deltas(other, exact, word_aligned):
+        print(f'\n0x{delta.address:08X} -{len(delta.removed)} +{len(delta.added)}')
+        if delta.removed:
+            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(delta.removed))) if disasm else ''
+            print(f'-- {delta.removed.hex().upper()}{asm}')
+        if delta.added:
+            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(delta.added))) if disasm else ''
+            print(f'++ {delta.added.hex().upper()}{asm}')
 
 
 def _disasm(file: str, start: int, unaligned: bool) -> None:
@@ -291,6 +300,7 @@ def main():
     write.add_argument('-s', '--start', type=_hex_int, default=-1, help='Optional custom start address')
     write.add_argument('-o', '--offset', type=_hex_int, default=0, help='Optional address offset')
     write.add_argument('-n', '--newline', choices=['auto', 'system', *_newlines], default='auto')
+    write.add_argument('-p', '--patch', default=None, required=False, help='Write out file patched with a diff')
     write.set_defaults(func=_write)
 
     help = 'Print info for one or more hex files.'
