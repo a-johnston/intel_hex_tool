@@ -24,6 +24,12 @@ def get_address_high_low(address: int) -> Tuple[int, int]:
     return (address >> 16) & 0xFFFF, address & 0xFFFF
 
 
+class Instruction(NamedTuple):
+    start: int
+    len: int
+    val: str
+
+
 class IntelHexRow(NamedTuple):
     address: int
     record_type: int
