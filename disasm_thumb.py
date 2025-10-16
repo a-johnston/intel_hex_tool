@@ -8,13 +8,13 @@ op_prefix_5 = 'STR STRH STRB LDRSB LDR LDRH LDRB LDRSH'.split()
 
 
 def _reg_list(value: int):
-    return ', '.join((f'L{i}' for i in range(8) if (value >> i) & 1))
+    return ', '.join((f'R{i}' for i in range(8) if (value >> i) & 1))
 
 
 thumb1_word_ref = {  # NB: Bits go from 15 to 0
     # Table B.5 p643-644 ARM System Developer's Guide
     '000ooiiiiimmmddd': lambda o, i, m, d: f'{["LSL", "LSR", "ASR"][o]} #{i} L{m} L{d}',
-    '00011fommmnnnddd': lambda f, o, m, n, d: f'{["ADD", "SUB"][o]} {["L", "#"][f]}{m} L{n} L{d}',
+    '00011fommmnnnddd': lambda f, o, m, n, d: f'{["ADD", "SUB"][o]} {"L#"[f]}{m} L{n} L{d}',
     '001oodddiiiiiiii': lambda o, d, i: f'{["MOV", "CMP", "ADD", "SUB"][o]} L{d} #{i}',
     '010000oooommmddd': lambda o, m, d: f'{op_prefix_4[o]} L{m} L{d}',
     '0100011000mmmddd': lambda m, d: f'CPY R{d}, R{m}',
@@ -42,21 +42,63 @@ thumb1_word_ref = {  # NB: Bits go from 15 to 0
     '111f1oooooooooo0': lambda f, o: f'BL{["", "X"][f]} offset={o}',
 }
 
-thumb2_word_ref = {
-    '00oooo': lambda o: 'shift/add/sub/move/cmp',
-    '010000': lambda: 'data processing',
-    '010001': lambda: 'special + bex',
-    '0101oo': lambda: 'load store single item',
-    '011ooo': lambda: 'load store single item',
-    '100ooo': lambda: 'load store single item',
-    '10100o': lambda: 'generate pc relative address',
-    '10101o': lambda: 'generate sp relative address',
-    '1011xx': lambda: 'misc',
-    '11000o': lambda: 'store multiple',
-    '11001o': lambda: 'load multiple',
-    '1101oo': lambda: 'conditional branch',
-    '11100o': lambda: 'unconditional branch',
+
+def _bl32(s: int, i: int, j: int) -> str:
+    label = (((j ^ (s * 3)) << 21) + i) * ((-1) ** s)
+    return f'BL label[{label:X}]'
+
+
+ops_010000 = 'AND EOR LSL LSR ASR ADC SBC ROR TST RSB CMP CMN ORR MUL BIC MVN'.split()
+ops_0101 = 'STR STRH STRB LDRSB LDR LDRH LDRB LDRSH'
+
+thumb2_single = {
+    '00': {
+        '0ooiiiiimmmddd': lambda o, i, m, d: f'{["LSL", "LSR", "ASR"][o]} R{d}, R{m}, #{i}',
+        '011fommmnnnddd': lambda f, o, m, n, d: f'{["ADD", "SUB"][o]} R{d}, R{n}, {"R#"[f]}{m}',
+        '1oonnniiiiiiii': lambda o, n, i: f'{["MOV", "CMP", "ADD", "SUB"][o]} R{n}, #{i}',
+    },
+    '010000oooommmnnn': lambda o, m, n: f'{ops_010000[o]} R{n}, R{m}{ {9: ", #0", 13: f", R{n}"}.get(o, "") }',
+    '010001': {
+        'oonmmmmnnn': lambda o, m, n: f'{["ADD", "CMP", "MOV"][o]} R{n}, R{m}',
+        '11ommmm000': lambda o, m: f'B{"L" * o}X R{m}',
+    },
+    '0101ooommmnnnttt': lambda o, m, n, t: f'{ops_0101[o]} R{t}, R{n}, R{m}',
+    '011foiiiiinnnttt': lambda f, o, i, n, t: f'{["STR, LDR"][o]}{"B" * f} R{t}, R{n}, #{i}',
+    '1000oiiiiinnnttt': lambda f, o, i, n, t: f'{["STR, LDR"][o]}H R{t}, R{n}, #{i}',
+    '1001otttiiiiiiii': lambda o, t, i: f'{["STR, LDR"][o]} R{t}, SP, #{i}',
+    '1010odddiiiiiiii': lambda o, d, i: f'{["ADR", "ADD"][o]} R{d},{" SP, " * o}, label[{i:X}]',
+    '1011': {
+        '0110011m00if': lambda m, i, f: f'CPS {["ENABLE", "DISABLE"][m]} PRIMASK={i} FAULTMASK{f}',
+        '0000oiiiiiii': lambda o, i: f'{["ADD", "SUB"][o]} SP, SP, #{i}',
+        'o0i1iiiiinnn': lambda o, i, n: f'CB{"N" * o}Z R{n}, label[{i:X}]',
+        '0010fgx': lambda f, g: f'{"SU"[f]}XT{"HB"[g]}',
+        '10100ommmddd': lambda o, m, d: f'REV{"16" * o} R{d}, R{m}',
+        '101011mmmddd': lambda m, d: f'REVSH R{d}, R{m}',
+        '110prrrrrrrr': lambda p, r: f'POP P={p} {_reg_list(r)}',
+        '1110iiiiiiii': lambda i: f'BKPT #{i}',
+        '1111': {
+            '0ooo0000': lambda o: f'{["NOP", "YIELD", "WFE", "WFI", "SEV"][o]}',
+            'xxxxyyyy': lambda x, y: f'IT firstcond={x} mask={y}',
+        },
+    },
+    '1100fnnnrrrrrrrr': lambda f, n, r: f'{["ST", "LD"][f]}M R{n}{"!" * (r >> f & 1 or not f)}, {_reg_list(r)}',
+    '1101cccciiiiiiii': lambda c, i: f'B{cond[c]} label[{i:X}]',
+    '11100iiiiiiiiiii': lambda i: f'B label[{i:X}]',
+    '11101': lambda: thumb2_double_word_11101,
+    '11110': lambda: thumb2_double_word_11110,
+    '11111': lambda: thumb2_double_word_11111,
 }
+
+thumb2_double_word_11101 = {}
+
+thumb2_double_word_11110 = {
+    'i01101snnnn0iiiddddiiiiiiii': lambda i, s, n, d: f'SUBS.W R{d}, R{n}, #{i} (S={s})',
+    'i101010nnnn0iiiddddiiiiiiii': lambda i, n, d: f'SUBW R{d}, R{n}, #{i}',
+    'siiiiiiiiii11j1jiiiiiiiiiii': _bl32,
+    '011101111111000111101fgoooo': lambda f, g, o: f'{"DI"[f]}{"SM"[g]}B {o:b}',
+}
+
+thumb2_double_word_11111 = {}
 
 
 def try_match_word(word: int, pattern: str) -> Optional[Dict[str, int]]:
