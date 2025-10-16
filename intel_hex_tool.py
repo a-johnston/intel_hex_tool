@@ -4,7 +4,7 @@ import sys
 from argparse import ArgumentParser
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 DATA_RECORD = 0
 EOF_RECORD = 1
@@ -257,11 +257,19 @@ def _diff(a: str, b: str, exact: bool) -> None:
         lines = [f'0x{i1:08X}']
         if tag in {'delete', 'replace'}:
             lines[0] += f' -{i2 - i1}'
-            lines.append(f'-- {a_bytes[i1:i2].hex().upper()}')
+            asm = disasm(a_bytes[i1:i2])
+            lines.append(f'-- {a_bytes[i1:i2].hex().upper()} {" \\ ".join(a.val for a in asm)}')
         if tag in {'insert', 'replace'}:
             lines[0] += f' +{j2 - j1}'
-            lines.append(f'++ {b_bytes[j1:j2].hex().upper()}')
+            asm = disasm(b_bytes[j1:j2])
+            lines.append(f'++ {b_bytes[j1:j2].hex().upper()} {" \\ ".join(a.val for a in asm)}')
         print('\n' + '\n'.join(lines), flush=True)
+
+
+def _disasm(file: str) -> None:
+    data = read_hex(file)
+    for instruction in disasm(data.get_full_bytes()):
+        print(f'{instruction.start:08X} : {instruction.val}')
 
 
 def main():
@@ -290,9 +298,130 @@ def main():
     diff.add_argument('--exact', action='store_true', help='Perform a slower diff that may output a smaller change')
     diff.set_defaults(func=_diff)
 
+    help = 'Show a thumb2 pseudo assembly for a given hex file.'
+    disasm = sub.add_parser('disasm', help=help, description=help)
+    disasm.add_argument('file', help='Input file')
+    disasm.set_defaults(func=_disasm)
+
     args = parser.parse_args()
     args.__dict__.pop('func')(**args.__dict__)
 
 
 if __name__ == '__main__':
     main()
+
+
+# Thumb2 disassembler start
+
+
+def _reg_list(value: int):
+    return ', '.join((f'R{i}' for i in range(8) if (value >> i) & 1))
+
+
+def _bl32(s: int, i: int, j: int) -> str:
+    label = (((j ^ (s * 3)) << 21) + i) * ((-1) ** s)
+    return f'BL label[{label:X}]'
+
+
+cond = 'EQ NE CS/HS CC/LO MI PL VS VC HI LS GE LT GT LE AL UDF SVC'.split()
+ops_010000 = 'AND EOR LSL LSR ASR ADC SBC ROR TST RSB CMP CMN ORR MUL BIC MVN'.split()
+ops_0101 = 'STR STRH STRB LDRSB LDR LDRH LDRB LDRSH'.split()
+
+thumb2_single = {
+    '00': {
+        '011fommmnnnddd': lambda f, o, m, n, d: f'{["ADD", "SUB"][o]} R{d}, R{n}, {"R#"[f]}{m}',
+        '0ooiiiiimmmddd': lambda o, i, m, d: f'{["LSL", "LSR", "ASR", "?"][o]} R{d}, R{m}, #{i}',
+        '1oonnniiiiiiii': lambda o, n, i: f'{["MOV", "CMP", "ADD", "SUB"][o]} R{n}, #{i}',
+    },
+    '010000oooommmnnn': lambda o, m, n: f'{ops_010000[o]} R{n}, R{m}{ {9: ", #0", 13: f", R{n}"}.get(o, "") }',
+    '010001': {
+        '11ommmm000': lambda o, m: f'B{"L" * o}X R{m}',
+        'oonmmmmnnn': lambda o, m, n: f'{["ADD", "CMP", "MOV", "?"][o]} R{n}, R{m}',
+    },
+    '0101ooommmnnnttt': lambda o, m, n, t: f'{ops_0101[o]} R{t}, R{n}, R{m}',
+    '011foiiiiinnnttt': lambda f, o, i, n, t: f'{["STR", "LDR"][o]}{"B" * f} R{t}, R{n}, #{i}',
+    '1000oiiiiinnnttt': lambda o, i, n, t: f'{["STR", "LDR"][o]}H R{t}, R{n}, #{i}',
+    '1001otttiiiiiiii': lambda o, t, i: f'{["STR", "LDR"][o]} R{t}, SP, #{i}',
+    '1010odddiiiiiiii': lambda o, d, i: f'{["ADR", "ADD"][o]} R{d},{" SP," * o} label[{i:X}]',
+    '1011': {
+        '0110011m00if': lambda m, i, f: f'CPS {["ENABLE", "DISABLE"][m]} PRIMASK={i} FAULTMASK{f}',
+        '0000oiiiiiii': lambda o, i: f'{["ADD", "SUB"][o]} SP, SP, #{i}',
+        'o0i1iiiiinnn': lambda o, i, n: f'CB{"N" * o}Z R{n}, label[{i:X}]',
+        '0010fgmmmddd': lambda f, g, m, d: f'{"SU"[f]}XT{"HB"[g]} R{d}, R{m}',
+        '10100ommmddd': lambda o, m, d: f'REV{"16" * o} R{d}, R{m}',
+        '101011mmmddd': lambda m, d: f'REVSH R{d}, R{m}',
+        '110prrrrrrrr': lambda p, r: f'POP P={p} {_reg_list(r)}',
+        '1110iiiiiiii': lambda i: f'BKPT #{i}',
+        '1111': {
+            '0ooo0000': lambda o: f'{["NOP", "YIELD", "WFE", "WFI", "SEV", *["?"] * 3][o]}',
+            'xxxxyyyy': lambda x, y: f'IT firstcond={x} mask={y}',
+        },
+    },
+    '1100fnnnrrrrrrrr': lambda f, n, r: f'{["ST", "LD"][f]}M R{n}{"!" * (r >> f & 1 or not f)}, {_reg_list(r)}',
+    '1101cccciiiiiiii': lambda c, i: f'B{cond[c]} label[{i:X}]',
+    '11100iiiiiiiiiii': lambda i: f'B label[{i:X}]',
+}
+
+thumb2_double = {
+    '11101': lambda: {},
+    '11110': {
+        'i01101snnnn0iiiddddiiiiiiii': lambda i, s, n, d: f'SUBS.W R{d}, R{n}, #{i} (S={s})',
+        'i101010nnnn0iiiddddiiiiiiii': lambda i, n, d: f'SUBW R{d}, R{n}, #{i}',
+        'siiiiiiiiii11j1jiiiiiiiiiii': _bl32,
+        '011101111111000111101fgoooo': lambda f, g, o: f'{"DI"[f]}{"SM"[g]}B {o:b}',
+    },
+    '11111': lambda: {},
+}
+
+
+def try_match_word(word: str, pattern: str, args: Dict[str, int]) -> bool:
+    for p, w in zip(pattern, word):
+        if p in '01':
+            if p != w:
+                return False
+        else:
+            if p not in args:
+                args[p] = 0
+            args[p] = args[p] * 2 + int(w)
+    return True
+
+
+def try_match_any(word: str, ref: Dict[str, Any], args: Dict[str, int]) -> Optional[str]:
+    for key in ref:
+        new_args = dict(args)
+        if try_match_word(word, key, new_args):
+            if isinstance(ref[key], dict):
+                result = try_match_any(word[len(key) :], ref[key], new_args)
+                if result is not None:
+                    return result
+            else:
+                result = ref[key](**new_args)
+                return None if '?' in result else result
+    return None
+
+
+def decode_chunk(data: bytes, index: int, step: int = 2) -> Instruction:
+    left = len(data) - index
+    default = Instruction(index, step, '?' * step)
+    if left < 2:
+        return Instruction(index, left, '?' * left)
+    op16 = int.from_bytes(data[index : index + 2], 'little')
+    if op16 >> 11 in {0b11101, 0b11110, 0b11111}:
+        if left < 4:
+            return Instruction(index, left, '')
+        op32 = int.from_bytes(data[index : index + 4], 'little')
+        match = try_match_any(bin(op32)[2:].zfill(32), thumb2_double, {})
+        return Instruction(index, 4, match) if match else default
+    else:
+        match = try_match_any(bin(op16)[2:].zfill(16), thumb2_single, {})
+        return Instruction(index, 2, match) if match else default
+
+
+def disasm(data: bytes, index: int = 0, aligned: bool = True) -> Iterable[Instruction]:
+    while index < len(data):
+        chunk = decode_chunk(data, index, aligned)
+        index += chunk.len
+        yield chunk
+
+
+# Thumb disassembler end
