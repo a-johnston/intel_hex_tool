@@ -8,6 +8,7 @@ All functionality is within `intel_hex_tool.py`. Requires at least python 3.6, n
 - Convert between intel and raw hex file formats
 - Diff two hex files
 - Data, extended linear, and EOF record types
+- Basic thumb2 disassembler
 
 ### Unimplemented Features
 - Segment address records or any of the weird ones mentioned on the wiki page
@@ -20,6 +21,7 @@ iht -h
 iht write -h
 iht info -h
 iht diff -h
+iht disasm -h
 ```
 
 ## Development

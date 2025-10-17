@@ -196,10 +196,6 @@ def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> Hex
     return HexData(_get_record_chunks(records), start, 'intel hex', linesep)
 
 
-def _hex_int(data: str) -> int:
-    return int(data, 0x10 if data.startswith('0x') else 10)
-
-
 def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str) -> None:
     data = read_hex(file)
     out = sys.stdout
@@ -239,7 +235,11 @@ def _info(files: List[str]) -> None:
             last = offset + len(chunk)
 
 
-def _diff(a: str, b: str, exact: bool) -> None:
+def _align(i1, i2) -> Tuple[int, int]:
+    return i1 - (i1 % 2), i2 + (i2 % 2)
+
+
+def _diff(a: str, b: str, exact: bool, disasm: bool, word_aligned: bool) -> None:
     data = read_hex(a)
     other = read_hex(b)
     if data.start != other.start:
@@ -252,24 +252,31 @@ def _diff(a: str, b: str, exact: bool) -> None:
     a_bytes = data.get_full_bytes()
     b_bytes = other.get_full_bytes()
     for tag, i1, i2, j1, j2 in SequenceMatcher(a=a_bytes, b=b_bytes, autojunk=not exact).get_opcodes():
+        if word_aligned:
+            i1, i2 = _align(i1, i2)
+            j1, j2 = _align(j1, j2)
         if tag == 'equal':
             continue
         lines = [f'0x{i1:08X}']
         if tag in {'delete', 'replace'}:
             lines[0] += f' -{i2 - i1}'
-            asm = disasm(a_bytes[i1:i2])
-            lines.append(f'-- {a_bytes[i1:i2].hex().upper()} {" \\ ".join(a.val for a in asm)}')
+            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(a_bytes[i1:i2]))) if disasm else ''
+            lines.append(f'-- {a_bytes[i1:i2].hex().upper()}{asm}')
         if tag in {'insert', 'replace'}:
             lines[0] += f' +{j2 - j1}'
-            asm = disasm(b_bytes[j1:j2])
-            lines.append(f'++ {b_bytes[j1:j2].hex().upper()} {" \\ ".join(a.val for a in asm)}')
+            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(b_bytes[j1:j2]))) if disasm else ''
+            lines.append(f'++ {b_bytes[j1:j2].hex().upper()}{asm}')
         print('\n' + '\n'.join(lines), flush=True)
 
 
-def _disasm(file: str) -> None:
+def _disasm(file: str, start: int, unaligned: bool) -> None:
     data = read_hex(file)
-    for instruction in disasm(data.get_full_bytes()):
+    for instruction in disasm_thumb2(data.get_full_bytes(), start, not unaligned):
         print(f'{instruction.start:08X} : {instruction.val}')
+
+
+def _hex_int(data: str) -> int:
+    return int(data, 0x10 if data.startswith('0x') else 10)
 
 
 def main():
@@ -295,12 +302,16 @@ def main():
     diff = sub.add_parser('diff', help=help, description=help)
     diff.add_argument('a')
     diff.add_argument('b')
-    diff.add_argument('--exact', action='store_true', help='Perform a slower diff that may output a smaller change')
+    diff.add_argument('--exact', action='store_true', help='Slower but may output a smaller change')
+    diff.add_argument('-d', '--disasm', action='store_true', help='Output thumb2 instructions for each diff section')
+    diff.add_argument('-a', '--word-aligned', action='store_true', help='Align diff to word boundaries')
     diff.set_defaults(func=_diff)
 
     help = 'Show a thumb2 pseudo assembly for a given hex file.'
     disasm = sub.add_parser('disasm', help=help, description=help)
     disasm.add_argument('file', help='Input file')
+    disasm.add_argument('-s', '--start', type=int, default=0, help='Starting byte offset for disassembly')
+    disasm.add_argument('-u', '--unaligned', action='store_true', help='Allow instruction decoding at any byte offset')
     disasm.set_defaults(func=_disasm)
 
     args = parser.parse_args()
@@ -319,15 +330,21 @@ def _reg_list(value: int):
 
 
 def _bl32(s: int, i: int, j: int) -> str:
-    label = (((j ^ (s * 3)) << 21) + i) * ((-1) ** s)
-    return f'BL label[{label:X}]'
+    return f'BL label[{(((j ^ (s * 3)) << 21) + i) * ((-1) ** s):X}]'
 
 
 cond = 'EQ NE CS/HS CC/LO MI PL VS VC HI LS GE LT GT LE AL UDF SVC'.split()
 ops_010000 = 'AND EOR LSL LSR ASR ADC SBC ROR TST RSB CMP CMN ORR MUL BIC MVN'.split()
 ops_0101 = 'STR STRH STRB LDRSB LDR LDRH LDRB LDRSH'.split()
 
-thumb2_single = {
+# The following maps are written following definitions from the ARMv7-M Architecture Reference Manual. The format
+# is string keys of the pattern [01a-zA-Z]+ mapped to either a callable responsible for generating the appropriate
+# assembly or a nested dict of further keys to match. Keys in the nested dict omit the matched key in the outer
+# dict but inherit the arguments matched by that key. Arguments must have single character names and are read as
+# contiguous bits, matching both 0 and 1 from a given word. Args are then unpacked into any matched callable which
+# should return a string. NB: If the returned string includes '?' it is ignored and the search continues.
+
+thumb2_single = {  # Section A5.2, pA5-129
     '00': {
         '011fommmnnnddd': lambda f, o, m, n, d: f'{["ADD", "SUB"][o]} R{d}, R{n}, {"R#"[f]}{m}',
         '0ooiiiiimmmddd': lambda o, i, m, d: f'{["LSL", "LSR", "ASR", "?"][o]} R{d}, R{m}, #{i}',
@@ -362,15 +379,15 @@ thumb2_single = {
     '11100iiiiiiiiiii': lambda i: f'B label[{i:X}]',
 }
 
-thumb2_double = {
-    '11101': lambda: {},
+thumb2_double = {  # Section A5.3, pA5-137
+    '11101': {},
     '11110': {
         'i01101snnnn0iiiddddiiiiiiii': lambda i, s, n, d: f'SUBS.W R{d}, R{n}, #{i} (S={s})',
         'i101010nnnn0iiiddddiiiiiiii': lambda i, n, d: f'SUBW R{d}, R{n}, #{i}',
         'siiiiiiiiii11j1jiiiiiiiiiii': _bl32,
         '011101111111000111101fgoooo': lambda f, g, o: f'{"DI"[f]}{"SM"[g]}B {o:b}',
     },
-    '11111': lambda: {},
+    '11111': {},
 }
 
 
@@ -400,7 +417,7 @@ def try_match_any(word: str, ref: Dict[str, Any], args: Dict[str, int]) -> Optio
     return None
 
 
-def decode_chunk(data: bytes, index: int, step: int = 2) -> Instruction:
+def decode_thumb2_chunk(data: bytes, index: int, step) -> Instruction:
     left = len(data) - index
     default = Instruction(index, step, '?' * step)
     if left < 2:
@@ -408,7 +425,7 @@ def decode_chunk(data: bytes, index: int, step: int = 2) -> Instruction:
     op16 = int.from_bytes(data[index : index + 2], 'little')
     if op16 >> 11 in {0b11101, 0b11110, 0b11111}:
         if left < 4:
-            return Instruction(index, left, '')
+            return Instruction(index, left, '?' * left)
         op32 = int.from_bytes(data[index : index + 4], 'little')
         match = try_match_any(bin(op32)[2:].zfill(32), thumb2_double, {})
         return Instruction(index, 4, match) if match else default
@@ -417,9 +434,9 @@ def decode_chunk(data: bytes, index: int, step: int = 2) -> Instruction:
         return Instruction(index, 2, match) if match else default
 
 
-def disasm(data: bytes, index: int = 0, aligned: bool = True) -> Iterable[Instruction]:
+def disasm_thumb2(data: bytes, index: int = 0, aligned: bool = True) -> Iterable[Instruction]:
     while index < len(data):
-        chunk = decode_chunk(data, index, aligned)
+        chunk = decode_thumb2_chunk(data, index, 2 if aligned else 1)
         index += chunk.len
         yield chunk
 
