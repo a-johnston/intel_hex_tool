@@ -100,6 +100,8 @@ class ByteDiffHunk(NamedTuple):
 
 
 class HexData(NamedTuple):
+    # TODO: Maybe store full bytes instead of chunks and instead only chunk when saving to intel? That would be
+    # make patching easier (if desired) and would also unlock chunking bin -> intel conversions.
     chunks: Dict[int, bytes]
     start: int
     type: str
@@ -114,9 +116,6 @@ class HexData(NamedTuple):
             content += data
             last = offset + len(data)
         return content
-
-    def get_full_hex(self) -> str:
-        return self.get_full_bytes().hex().upper()
 
     def to_intel_rows(
         self, custom_offset: int = 0, custom_start: int = -1, max_data_bytes: int = 16
@@ -148,9 +147,6 @@ class HexData(NamedTuple):
                     i1, i2 = _align(i1, i2)
                     j1, j2 = _align(j1, j2)
                 yield ByteDiffHunk(offset + i1, a[i1:i2], offset + j1, b[j1:j2])
-
-    def apply_delta(self, delta: ByteDiffHunk) -> None:
-        pass
 
 
 def read_hex(file: str) -> HexData:
