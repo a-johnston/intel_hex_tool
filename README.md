@@ -4,15 +4,6 @@ Simple CLI tool for working with [intel](https://en.wikipedia.org/wiki/Intel_HEX
 
 All functionality is within `intel_hex_tool.py`. Requires at least python 3.6, no 3rd party dependencies. If used in a venv, can be called with `iht`.
 
-### Implemented Features
-- Convert between intel and raw hex file formats
-- Diff two hex files
-- Data, extended linear, and EOF record types
-- Basic thumb2 disassembler
-
-### Unimplemented Features
-- Segment address records or any of the weird ones mentioned on the wiki page
-- Patching files using the output of the diff command (TODO)
 
 ### Usage
 
