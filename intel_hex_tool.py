@@ -24,6 +24,10 @@ def get_address_high_low(address: int) -> Tuple[int, int]:
     return (address >> 16) & 0xFFFF, address & 0xFFFF
 
 
+def hex_int(data: str) -> int:
+    return int(data, 0x10 if data.startswith('0x') else 10)
+
+
 class Instruction(NamedTuple):
     start: int
     len: int
@@ -78,10 +82,21 @@ class IntelHexRow(NamedTuple):
         return start_code + (self._get_non_checksum_bytes() + self.checksum.to_bytes(1, 'big')).hex().upper()
 
 
-class HexDelta(NamedTuple):
-    address: int
+class ByteDiffHunk(NamedTuple):
+    address_removed: int
     removed: bytes
+    address_added: int
     added: bytes
+
+    def format(self, disasm: bool = False) -> str:
+        s = f'@@ -0x{self.address_removed:08X},{len(self.removed)} +0x{self.address_added:08X},{len(self.added)} @@'
+        if self.added:
+            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(self.added))) if disasm else ''
+            s += f'\n+{self.added.hex().upper()}{asm}'
+        if self.removed:
+            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(self.removed))) if disasm else ''
+            s += f'\n-{self.removed.hex().upper()}{asm}'
+        return s
 
 
 class HexData(NamedTuple):
@@ -123,17 +138,18 @@ class HexData(NamedTuple):
             yield IntelHexRow(0, START_ADDRESS_RECORD, start.to_bytes(4, 'big'), [])
         yield IntelHexRow(0, EOF_RECORD, b'', [])
 
-    def get_deltas(self, other: 'HexData', exact: bool = False, word_aligned: bool = False) -> Iterable[HexDelta]:
+    def get_deltas(self, other: 'HexData', exact: bool = False, word_aligned: bool = False) -> Iterable[ByteDiffHunk]:
         a = self.get_full_bytes()
         b = other.get_full_bytes()
+        offset = min(self.chunks)
         for tag, i1, i2, j1, j2 in SequenceMatcher(a=a, b=b, autojunk=not exact).get_opcodes():
             if tag != 'equal':
                 if word_aligned:
                     i1, i2 = _align(i1, i2)
                     j1, j2 = _align(j1, j2)
-                yield HexDelta(min(self.chunks) + i1, a[i1:i2], b[j1:j2])
+                yield ByteDiffHunk(offset + i1, a[i1:i2], offset + j1, b[j1:j2])
 
-    def apply_delta(self, delta: HexDelta) -> None:
+    def apply_delta(self, delta: ByteDiffHunk) -> None:
         pass
 
 
@@ -215,14 +231,13 @@ def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> Hex
     return HexData(_get_record_chunks(records), start, 'intel hex', linesep)
 
 
-def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str) -> None:
+def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str, patch: Optional[str]) -> None:
     data = read_hex(file)
-    out = sys.stdout
-    if output != '-':
-        out = open(output, 'wb' if binary == 'binary' else 'w')
     if binary:
-        pass
+        out = sys.stdout.buffer if output == '-' else open(output, 'wb')
+        out.write(data.get_full_bytes())
     else:
+        out = sys.stdout if output == '-' else open(output, 'w')
         rows = data.to_intel_rows(custom_offset=offset, custom_start=start)
         newline = (data.newline or os.linesep) if newline == 'auto' else _newlines[newline]
         if newline == 'auto' and data.newline:
@@ -262,30 +277,20 @@ def _diff(a: str, b: str, exact: bool, disasm: bool, word_aligned: bool) -> None
     data = read_hex(a)
     other = read_hex(b)
     if data.start != other.start:
-        print(f'Start: 0x{data.start:08X} != 0x{other.start:08X}')
+        print(f'Start -{data.start:08X}  +{other.start:08X}')
     data_offset = min(data.chunks)
     other_offset = min(other.chunks)
     if data_offset != other_offset:
-        print(f'Offset: 0x{data_offset:08X} != 0x{other_offset:08X}')
+        print(f'Offset -{data_offset:08X} +{other_offset:08X}')
 
     for delta in data.get_deltas(other, exact, word_aligned):
-        print(f'\n0x{delta.address:08X} -{len(delta.removed)} +{len(delta.added)}')
-        if delta.removed:
-            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(delta.removed))) if disasm else ''
-            print(f'-- {delta.removed.hex().upper()}{asm}')
-        if delta.added:
-            asm = (' : ' + ' / '.join(a.val for a in disasm_thumb2(delta.added))) if disasm else ''
-            print(f'++ {delta.added.hex().upper()}{asm}')
+        print('\n' + delta.format(disasm))
 
 
 def _disasm(file: str, start: int, unaligned: bool) -> None:
     data = read_hex(file)
     for instruction in disasm_thumb2(data.get_full_bytes(), start, not unaligned):
         print(f'{instruction.start:08X} : {instruction.val}')
-
-
-def _hex_int(data: str) -> int:
-    return int(data, 0x10 if data.startswith('0x') else 10)
 
 
 def main():
@@ -297,8 +302,8 @@ def main():
     write.add_argument('file', help='Input file')
     write.add_argument('output', default='-', nargs='?')
     write.add_argument('-b', '--binary', action='store_true', help='Output a binary file; strips start and offset')
-    write.add_argument('-s', '--start', type=_hex_int, default=-1, help='Optional custom start address')
-    write.add_argument('-o', '--offset', type=_hex_int, default=0, help='Optional address offset')
+    write.add_argument('-s', '--start', type=hex_int, default=-1, help='Optional custom start address')
+    write.add_argument('-o', '--offset', type=hex_int, default=0, help='Optional address offset')
     write.add_argument('-n', '--newline', choices=['auto', 'system', *_newlines], default='auto')
     write.add_argument('-p', '--patch', default=None, required=False, help='Write out file patched with a diff')
     write.set_defaults(func=_write)
@@ -407,9 +412,7 @@ def try_match_word(word: str, pattern: str, args: Dict[str, int]) -> bool:
             if p != w:
                 return False
         else:
-            if p not in args:
-                args[p] = 0
-            args[p] = args[p] * 2 + int(w)
+            args[p] = args.get(p, 0) * 2 + int(w)
     return True
 
 
