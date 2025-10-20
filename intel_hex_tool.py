@@ -227,7 +227,7 @@ def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> Hex
     return HexData(_get_record_chunks(records), start, 'intel hex', linesep)
 
 
-def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str, patch: Optional[str]) -> None:
+def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str) -> None:
     data = read_hex(file)
     if binary:
         out = sys.stdout.buffer if output == '-' else open(output, 'wb')
@@ -301,7 +301,6 @@ def main():
     write.add_argument('-s', '--start', type=hex_int, default=-1, help='Optional custom start address')
     write.add_argument('-o', '--offset', type=hex_int, default=0, help='Optional address offset')
     write.add_argument('-n', '--newline', choices=['auto', 'system', *_newlines], default='auto')
-    write.add_argument('-p', '--patch', default=None, required=False, help='Write out file patched with a diff')
     write.set_defaults(func=_write)
 
     help = 'Print info for one or more hex files.'
