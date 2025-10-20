@@ -55,4 +55,4 @@ class TestIntelHexTool(unittest.TestCase):
                 data = iht.read_hex(file)
                 self.assertEqual(start, data.start)
                 self.assertEqual(offset, min(data.chunks))
-                self.assertEqual('DEADBEEF', data.get_full_hex())
+                self.assertEqual('DEADBEEF', data.get_full_bytes().hex().upper())

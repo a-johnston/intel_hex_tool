@@ -422,7 +422,8 @@ def try_match_any(word: str, ref: Dict[str, Any], args: Dict[str, int]) -> Optio
                     return result
             else:
                 result = ref[key](**new_args)
-                return None if '?' in result else result
+                if '?' not in result:
+                    return result
     return None
 
 
