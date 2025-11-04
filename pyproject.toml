@@ -36,7 +36,7 @@ iht = "intel_hex_tool:main"
 [dependency-groups]
 dev = [
   "IPython",
-  "pre-commit",
+  "prek ; python_version >= '3.8'",
   "ruff",
   "ty ; python_version >= '3.8'",
   "vermin",
