@@ -233,9 +233,8 @@ def _write(file: str, output: str, binary: bool, start: int, offset: int, newlin
         out = sys.stdout.buffer if output == '-' else open(output, 'wb')
         out.write(data.get_full_bytes())
     else:
-        out = sys.stdout if output == '-' else open(output, 'w')
+        out = sys.stdout if output == '-' else open(output, 'w', newline='')
         rows = data.to_intel_rows(custom_offset=offset, custom_start=start)
-        newline = (data.newline or os.linesep) if newline == 'auto' else _newlines[newline]
         if newline == 'auto' and data.newline:
             newline = data.newline
         else:
@@ -248,7 +247,7 @@ def _write(file: str, output: str, binary: bool, start: int, offset: int, newlin
 def _info(files: List[str]) -> None:
     for file in files:
         data = read_hex(file)
-        print(f'Info for {file}')
+        print(f'\nInfo for {file}')
         print(f'  Type:\t\t{data.type}')
         print(f'  Start:\t0x{data.start:08X}')
         if data.newline:
