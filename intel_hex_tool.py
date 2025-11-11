@@ -182,7 +182,7 @@ def _get_record_chunks(records: List[IntelHexRow], max_byte_fill: int = 4) -> Di
             gap = record.address - chunk_start - len(chunk)
             if gap < 0:
                 raise Exception(f'Overlapping records detected at address {record.address:08X}')
-            if 0 < gap <= max_byte_fill:
+            if gap <= max_byte_fill:
                 chunk += bytes(gap)
             else:
                 chunks[chunk_start] = chunk
