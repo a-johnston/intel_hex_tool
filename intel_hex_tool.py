@@ -15,6 +15,11 @@ _newlines = {'unix': '\n', 'dos': '\r\n'}
 _newline_name = {v: k for k, v in _newlines.items()}
 
 
+def format_newline_info(newline: str) -> str:
+    name = _newline_name.get(newline, 'unknown')
+    return f'{newline!r} ({name})'
+
+
 def warning(text: str) -> str:
     return f'\033[93m{text}\033[0m'
 
@@ -251,8 +256,7 @@ def _info(files: List[str]) -> None:
         print(f'  Type:\t\t{data.type}')
         print(f'  Start:\t0x{data.start:08X}')
         if data.newline:
-            newline_name = _newline_name.get(data.newline, 'unknown')
-            print(f'  Line endings:\t{data.newline!r} ({newline_name})')
+            print(f'  Line endings:\t{format_newline_info(data.newline)}')
         print('  Chunks:')
         last = -1
         for offset, chunk in data.chunks.items():
@@ -269,16 +273,23 @@ def _align(i1, i2) -> Tuple[int, int]:
 
 
 def _diff(a: str, b: str, exact: bool, disasm: bool, word_aligned: bool) -> None:
-    data = read_hex(a)
-    other = read_hex(b)
-    if data.start != other.start:
-        print(f'Start -{data.start:08X}  +{other.start:08X}')
-    data_offset = min(data.chunks)
-    other_offset = min(other.chunks)
-    if data_offset != other_offset:
-        print(f'Offset -{data_offset:08X} +{other_offset:08X}')
+    old = read_hex(a)
+    new = read_hex(b)
+    if old.start != new.start:
+        print(f'Start -{old.start:08X}  +{new.start:08X}')
 
-    for delta in data.get_deltas(other, exact, word_aligned):
+    old_offset = min(old.chunks)
+    new_offset = min(new.chunks)
+    if old_offset != new_offset:
+        print(f'Offset -{old_offset:08X} +{new_offset:08X}')
+
+    if old.newline or new.newline:  # Skip if both inputs are binary
+        old_newline = format_newline_info(old.newline)
+        new_newline = format_newline_info(new.newline)
+        if old_newline != new_newline:
+            print(f'Newline -{old_newline} +{new_newline}')
+
+    for delta in old.get_deltas(new, exact, word_aligned):
         print('\n' + delta.format(disasm))
 
 
