@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
+# intel_hex_tool.py
+# Copyright (c) 2025 Adam Johnston
+# This file is licensed under the MIT License
+# Full license and project information at: https://github.com/a-johnston/intel_hex_tool/
+
 import os
 import sys
 from argparse import ArgumentParser
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
+
+__version__ = '0.1.0'
 
 DATA_RECORD = 0
 EOF_RECORD = 1
@@ -105,53 +112,36 @@ class ByteDiffHunk(NamedTuple):
 
 
 class HexData(NamedTuple):
-    # TODO: Maybe store full bytes instead of chunks and instead only chunk when saving to intel? That would be
-    # make patching easier (if desired) and would also unlock chunking bin -> intel conversions.
-    chunks: Dict[int, bytes]
+    offset: int
     start: int
+    data: bytes
     type: str
     newline: str
 
-    def get_full_bytes(self) -> bytes:
-        last = -1
-        content = b''
-        for offset, data in self.chunks.items():
-            if last != -1:
-                content += bytes(offset - last)
-            content += data
-            last = offset + len(data)
-        return content
-
     def to_intel_rows(
-        self, custom_offset: int = 0, custom_start: int = -1, max_data_bytes: int = 16
+        self, custom_offset: int = -1, custom_start: int = -1, max_data_bytes: int = 16
     ) -> Iterable[IntelHexRow]:
-        last_hi = 0
-        for offset, data in sorted(self.chunks.items()):
-            offset += custom_offset
-            extended_address, address = get_address_high_low(offset)
-            if last_hi != extended_address:
-                yield IntelHexRow(0, EXTENDED_LINEAR_ADDRESS_RECORD, extended_address.to_bytes(2, 'big'), [])
-                last_hi = extended_address
-            for i in range(0, len(data), max_data_bytes):
-                row_data = data[i : i + max_data_bytes]
+        extended_address, address = get_address_high_low(custom_offset if custom_offset >= 0 else self.offset)
+        if extended_address > 0:
+            yield IntelHexRow(0, EXTENDED_LINEAR_ADDRESS_RECORD, extended_address.to_bytes(2, 'big'), [])
+        for i in range(0, len(self.data), max_data_bytes):
+            row_data = self.data[i : i + max_data_bytes]
+            if sum(row_data) > 0:
                 row = IntelHexRow(address, DATA_RECORD, row_data, [])
-                address += len(row_data)
                 yield row
+            address += len(row_data)
         start = self.start if custom_start < 0 else custom_start
         if start > 0:
             yield IntelHexRow(0, START_ADDRESS_RECORD, start.to_bytes(4, 'big'), [])
         yield IntelHexRow(0, EOF_RECORD, b'', [])
 
     def get_deltas(self, other: 'HexData', exact: bool = False, word_aligned: bool = False) -> Iterable[ByteDiffHunk]:
-        a = self.get_full_bytes()
-        b = other.get_full_bytes()
-        offset = min(self.chunks)
-        for tag, i1, i2, j1, j2 in SequenceMatcher(a=a, b=b, autojunk=not exact).get_opcodes():
+        for tag, i1, i2, j1, j2 in SequenceMatcher(a=self.data, b=other.data, autojunk=not exact).get_opcodes():
             if tag != 'equal':
                 if word_aligned:
                     i1, i2 = _align(i1, i2)
                     j1, j2 = _align(j1, j2)
-                yield ByteDiffHunk(offset + i1, a[i1:i2], offset + j1, b[j1:j2])
+                yield ByteDiffHunk(self.offset + i1, self.data[i1:i2], other.offset + j1, other.data[j1:j2])
 
 
 def read_hex(file: str) -> HexData:
@@ -169,34 +159,7 @@ def read_bin_hex(file: str) -> HexData:
     files = list(Path('.').glob(file))
     if len(files) != 1:
         raise ValueError(f'Need exactly one file matching {file} to read binary')
-    # TODO: Find zero blocks and break into chunks
-    return HexData({0: files[0].read_bytes()}, 0, 'bin', '')
-
-
-def _get_record_chunks(records: List[IntelHexRow], max_byte_fill: int = 4) -> Dict[int, bytes]:
-    """Puts records in order and assembles them into contiguous chunks. Gaps greater
-    than max_byte_fill cause multiple chunks to be generated. Other gaps are zero-filled.
-    """
-    chunks = {}
-    records.sort(key=lambda row: row.address)
-    chunk_start = records[0].address
-    chunk = b''
-    for i in range(len(records)):
-        record = records[i]
-        if chunk_start != -1:
-            gap = record.address - chunk_start - len(chunk)
-            if gap < 0:
-                raise Exception(f'Overlapping records detected at address {record.address:08X}')
-            if gap <= max_byte_fill:
-                chunk += bytes(gap)
-            else:
-                chunks[chunk_start] = chunk
-                chunk = b''
-                chunk_start = record.address
-        chunk += record.data
-    if chunk:
-        chunks[chunk_start] = chunk
-    return chunks
+    return HexData(0, 0, files[0].read_bytes(), 'bin', '')
 
 
 def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> HexData:
@@ -204,12 +167,12 @@ def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> Hex
     records = []
     extended_address = 0
     start = -1
-    linesep = ''
+    newline = ''
     for path in Path('.').glob(file):
         with path.open('r', newline='') as fp:
             for line in fp.readlines():
-                if not linesep:
-                    linesep = line[len(line.rstrip()) :]
+                if not newline:
+                    newline = line[len(line.rstrip()) :]
                 # Remove comments and skip non-record lines
                 line = line.split(comment, 1)[0].strip()
                 if start_code not in line:
@@ -229,14 +192,23 @@ def read_intel_hex(file: str, start_code: str = ':', comment: str = '//') -> Hex
                     break
                 else:
                     print(warning(f'Ignoring record with type {row.record_type.to_bytes(1, "big")}'))
-    return HexData(_get_record_chunks(records), start, 'intel hex', linesep)
+    data = b''
+    records.sort(key=lambda row: row.address)
+    last_address = records[0].address
+    for record in records:
+        gap = record.address - last_address
+        if gap < 0:
+            raise Exception(f'Overlapping records detected at address {record.address:08X}')
+        data += bytes(gap)
+        data += record.data
+    return HexData(offset=records[0].address, start=start, data=data, type='intel hex', newline=newline)
 
 
 def _write(file: str, output: str, binary: bool, start: int, offset: int, newline: str) -> None:
     data = read_hex(file)
     if binary:
         out = sys.stdout.buffer if output == '-' else open(output, 'wb')
-        out.write(data.get_full_bytes())
+        out.write(data.data)
     else:
         out = sys.stdout if output == '-' else open(output, 'w', newline='')
         rows = data.to_intel_rows(custom_offset=offset, custom_start=start)
@@ -245,6 +217,7 @@ def _write(file: str, output: str, binary: bool, start: int, offset: int, newlin
         else:
             newline = _newlines.get(newline, os.linesep)
         out.write(newline.join(map(IntelHexRow.dumps, rows)) + newline)
+    out.flush()
     if output != '-':
         out.close()
 
@@ -255,17 +228,10 @@ def _info(files: List[str]) -> None:
         print(f'\nInfo for {file}')
         print(f'  Type:\t\t{data.type}')
         print(f'  Start:\t0x{data.start:08X}')
+        print(f'  Offset:\t0x{data.offset:08X}')
+        print(f'  Length:\t0x{len(data.data):08X}')
         if data.newline:
             print(f'  Line endings:\t{format_newline_info(data.newline)}')
-        print('  Chunks:')
-        last = -1
-        for offset, chunk in data.chunks.items():
-            if last != -1:
-                gap = offset - last
-                if gap > 0:
-                    print(f'    (0x00 x {gap})')
-            print(f'    Offset = 0x{offset:08X} Length = {(len(chunk))} bytes')
-            last = offset + len(chunk)
 
 
 def _align(i1, i2) -> Tuple[int, int]:
@@ -278,10 +244,8 @@ def _diff(a: str, b: str, exact: bool, disasm: bool, word_aligned: bool) -> None
     if old.start != new.start:
         print(f'Start -{old.start:08X}  +{new.start:08X}')
 
-    old_offset = min(old.chunks)
-    new_offset = min(new.chunks)
-    if old_offset != new_offset:
-        print(f'Offset -{old_offset:08X} +{new_offset:08X}')
+    if old.offset != new.offset:
+        print(f'Offset -{old.offset:08X} +{new.offset:08X}')
 
     if old.newline or new.newline:  # Skip if both inputs are binary
         old_newline = format_newline_info(old.newline)
@@ -295,12 +259,12 @@ def _diff(a: str, b: str, exact: bool, disasm: bool, word_aligned: bool) -> None
 
 def _disasm(file: str, start: int, unaligned: bool) -> None:
     data = read_hex(file)
-    for instruction in disasm_thumb2(data.get_full_bytes(), start, not unaligned):
+    for instruction in disasm_thumb2(data.data, start, not unaligned):
         print(f'{instruction.start:08X} : {instruction.val}')
 
 
 def main():
-    parser = ArgumentParser(description='Hex file conversion and comparison utilities.')
+    parser = ArgumentParser(description=f'Hex file conversion and comparison utilities. (version {__version__})')
     sub = parser.add_subparsers(title='commands')
 
     help = 'Read and write out a hex file in either intel or binary format.'

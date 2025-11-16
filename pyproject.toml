@@ -1,6 +1,6 @@
 [project]
 name = "intel-hex-tool"
-version = "0.0.1"
+version = "0.1.0"
 description = "Simple CLI tool for working with binary and intel hex files"
 readme = "README.md"
 license = "MIT"
