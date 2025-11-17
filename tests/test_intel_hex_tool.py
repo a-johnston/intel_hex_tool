@@ -48,7 +48,7 @@ class TestIntelHexTool(unittest.TestCase):
         files = (
             # NB: test.hex includes leading and trailing comments as well as lines without records
             ('intel', 'tests/data_part*.hex', 123, int('08015E7D', 0x10)),
-            ('bin', 'tests/data.bin', 0, 0),
+            ('bin', 'tests/data.bin', -1, 0),
         )
         for kind, file, start, offset in files:
             with self.subTest(kind):
